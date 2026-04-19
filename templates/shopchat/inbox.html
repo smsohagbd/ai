@@ -97,6 +97,8 @@
   let tickTimer = null;
   let batchDeadline = 0;
   let isSending = false;
+  let messengerPollTimer = null;
+  let messengerPollSig = '';
 
   const urls = {
     list: '{% url "inbox_conversations_api" %}',
@@ -245,6 +247,39 @@
     return row;
   }
 
+  function messagesPollSignature(messages) {
+    if (!messages || !messages.length) return '0';
+    const last = messages[messages.length - 1];
+    return messages.length + '|' + (last.time || '');
+  }
+
+  function clearMessengerPoll() {
+    if (messengerPollTimer) {
+      clearInterval(messengerPollTimer);
+      messengerPollTimer = null;
+    }
+  }
+
+  function startMessengerPoll() {
+    clearMessengerPoll();
+    messengerPollTimer = setInterval(pollOpenMessengerThread, 4000);
+  }
+
+  async function pollOpenMessengerThread() {
+    if (!selectedId || selectedChannel !== 'messenger' || document.visibilityState === 'hidden') {
+      return;
+    }
+    try {
+      const r = await fetch(urls.messages(selectedId));
+      const data = await r.json().catch(function () { return {}; });
+      if (!r.ok || !data.ok || !data.messages) return;
+      const sig = messagesPollSignature(data.messages);
+      if (sig === messengerPollSig) return;
+      messengerPollSig = sig;
+      renderMessages(data.messages);
+    } catch (e) { /* ignore */ }
+  }
+
   function renderMessages(messages) {
     thread.innerHTML = '';
     for (const m of messages) {
@@ -296,6 +331,16 @@
     backBtn.addEventListener('click', function () {
       setMobileChatOpen(false);
     });
+  }
+
+  async function refreshConversationListOnly() {
+    try {
+      const r = await fetch(urls.list);
+      const data = await r.json().catch(function () { return {}; });
+      if (!r.ok || !data.ok) return;
+      conversations = (data.conversations && data.conversations.slice()) || [];
+      renderConvList();
+    } catch (e) { /* ignore */ }
   }
 
   function renderConvList() {
@@ -352,6 +397,8 @@
 
   async function loadThread(id, opts) {
     opts = opts || {};
+    clearMessengerPoll();
+    messengerPollSig = '';
     thread.innerHTML = '';
     try {
       const r = await fetch(urls.messages(id));
@@ -374,7 +421,12 @@
         ? 'Web test — messages go to the AI only (same as Testing / Production for Messenger outbound).'
         : 'Messenger — read conversation here; customers message your Page.';
       composerWrap.hidden = !canCompose;
-      renderMessages(data.messages || []);
+      const msgs = data.messages || [];
+      messengerPollSig = messagesPollSignature(msgs);
+      renderMessages(msgs);
+      if (selectedChannel === 'messenger') {
+        startMessengerPoll();
+      }
       renderConvList();
       if (opts.revealMobile) setMobileChatOpen(true);
       history.replaceState(null, '', '?c=' + id);
@@ -470,7 +522,7 @@
       } else if (data.messages) {
         renderMessages(data.messages);
       }
-      await loadConversations();
+      await refreshConversationListOnly();
     } catch (err) {
       appendError(String(err));
     } finally {
@@ -512,6 +564,12 @@
   textarea.addEventListener('input', function () {
     textarea.style.height = 'auto';
     textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && selectedChannel === 'messenger' && selectedId) {
+      pollOpenMessengerThread();
+    }
   });
 
   loadConversations();

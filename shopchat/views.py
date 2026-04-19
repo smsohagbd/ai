@@ -2,6 +2,7 @@ import json
 import logging
 
 from django.conf import settings as django_settings
+from django.db.models import OuterRef, Subquery
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.csrf import csrf_exempt
@@ -92,13 +93,28 @@ def _serialize_message(m: ChatMessage, request=None) -> dict:
     }
 
 
-def _conversation_row(c: Conversation, request) -> dict:
+def _preview_for_conversation_row(c: Conversation) -> str:
+    """Sidebar preview; uses annotate fields when present to avoid N+1 queries."""
+    if hasattr(c, "_last_preview_text"):
+        t = c._last_preview_text
+        had = getattr(c, "_last_had_image", False)
+        if t is not None and str(t).strip():
+            return str(t).strip().replace("\n", " ")[:120]
+        if had:
+            return "(photo)"
+        return ""
     last = c.messages.order_by("-created_at").first()
-    preview = ""
-    if last and last.text:
-        preview = last.text.strip().replace("\n", " ")[:120]
-    elif last and last.had_image:
-        preview = "(photo)"
+    if not last:
+        return ""
+    if last.text:
+        return last.text.strip().replace("\n", " ")[:120]
+    if last.had_image:
+        return "(photo)"
+    return ""
+
+
+def _conversation_row(c: Conversation, request) -> dict:
+    preview = _preview_for_conversation_row(c)
     can_compose = (
         c.channel == Conversation.Channel.WEB_TEST
         and c.web_session_key == _ensure_chat_session(request)
@@ -123,7 +139,16 @@ def inbox_conversations_api(request):
         "INBOX_RECENT_CONVERSATIONS_LIMIT",
         80,
     )
-    qs = Conversation.objects.order_by("-updated_at")[:limit]
+    last_msg = ChatMessage.objects.filter(conversation_id=OuterRef("pk")).order_by(
+        "-created_at"
+    )
+    qs = (
+        Conversation.objects.annotate(
+            _last_preview_text=Subquery(last_msg.values("text")[:1]),
+            _last_had_image=Subquery(last_msg.values("had_image")[:1]),
+        )
+        .order_by("-updated_at")[:limit]
+    )
     rows = [_conversation_row(c, request) for c in qs]
     return JsonResponse(
         {
