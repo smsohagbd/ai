@@ -34,7 +34,7 @@ ALLOWED_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "ALLOWED_HOSTS",
-        "localhost,127.0.0.1,bot.sohag.com.bd",
+        "localhost,127.0.0.1,bot.sohag.com.bd,15.204.67.249",
     ).split(",")
     if h.strip()
 ]
