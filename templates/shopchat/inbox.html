@@ -1,0 +1,520 @@
+{% extends "base.html" %}
+{% block title %}Inbox · Shop assistant{% endblock %}
+{% block body_class %}page-inbox{% endblock %}
+{% block content %}
+<div class="inbox-shell" id="inbox-root"
+     data-batch-ms="{{ batch_idle_ms|default:5000 }}">
+  <aside class="inbox-sidebar" aria-label="Conversations">
+    <div class="inbox-sidebar-head">
+      <h1 class="inbox-sidebar-title">Messages</h1>
+      <nav class="inbox-mobile-actions" aria-label="Shortcuts">
+        <a href="{% url 'settings' %}">Settings</a>
+        <a href="/admin/">Admin</a>
+      </nav>
+      <p class="inbox-sidebar-sub">Showing the <strong>{{ inbox_recent_limit|default:80 }} most recent</strong> chats (by last activity). Open a thread below or use a direct link — older threads stay in the database but are not listed here.</p>
+    </div>
+    <ul id="conv-list" class="conv-list"></ul>
+  </aside>
+
+  <section class="inbox-main">
+    <div class="messenger" id="messenger-root">
+      <div class="messenger-head">
+        <button type="button" class="inbox-back" id="inbox-back" aria-label="Back to conversations">
+          <span class="inbox-back-icon" aria-hidden="true">←</span>
+          <span class="inbox-back-text">Chats</span>
+        </button>
+        <div class="messenger-head-inner">
+          <h2 class="messenger-title" id="thread-title">…</h2>
+          <p class="messenger-sub" id="thread-sub"></p>
+        </div>
+      </div>
+
+      <div id="thread" class="messenger-thread" aria-live="polite"></div>
+
+      <div id="batch-bar" class="batch-bar" hidden>
+        <span id="batch-status" class="batch-status"></span>
+        <button type="button" class="btn batch-now" id="flush-batch-btn">Send now</button>
+      </div>
+
+      <div id="composer-wrap" class="messenger-composer" hidden>
+        <form id="chat-form" class="composer-form" enctype="multipart/form-data">
+          {% csrf_token %}
+          <div class="composer-attach">
+            <label class="attach-btn" title="Add photos (multiple)">
+              <input type="file" name="images" accept="image/*" multiple hidden>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+            </label>
+            <span id="attach-name" class="attach-name"></span>
+          </div>
+          <div class="composer-row">
+            <textarea name="message" rows="1" class="composer-input" placeholder="Message…" autocomplete="off"></textarea>
+            <button type="submit" class="composer-send" id="send-btn" aria-label="Send">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </button>
+          </div>
+          <div id="status" class="composer-status" role="status"></div>
+        </form>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  const root = document.getElementById('inbox-root');
+  const BATCH_MS = Number(root.dataset.batchMs) || 5000;
+  /** Deep-link only (?c=). Otherwise we open the first row = most recent activity. */
+  let urlConversationId = 0;
+  const _qp = new URLSearchParams(window.location.search).get('c');
+  if (_qp) {
+    const _n = Number(_qp);
+    if (!isNaN(_n)) urlConversationId = _n;
+  }
+  const listEl = document.getElementById('conv-list');
+  const titleEl = document.getElementById('thread-title');
+  const subEl = document.getElementById('thread-sub');
+  const composerWrap = document.getElementById('composer-wrap');
+  const form = document.getElementById('chat-form');
+  const thread = document.getElementById('thread');
+  const statusEl = document.getElementById('status');
+  const btn = document.getElementById('send-btn');
+  const fileInput = form.querySelector('input[name="images"]');
+  const attachName = document.getElementById('attach-name');
+  const textarea = form.querySelector('textarea');
+  const batchBar = document.getElementById('batch-bar');
+  const batchStatus = document.getElementById('batch-status');
+  const flushBatchBtn = document.getElementById('flush-batch-btn');
+  const inboxShell = document.querySelector('.inbox-shell');
+  const backBtn = document.getElementById('inbox-back');
+  const mqMobile = window.matchMedia('(max-width: 720px)');
+
+  let conversations = [];
+  let selectedId = null;
+  let selectedChannel = 'web_test';
+  let canCompose = false;
+  let pendingSegments = [];
+  let debounceTimer = null;
+  let tickTimer = null;
+  let batchDeadline = 0;
+  let isSending = false;
+
+  const urls = {
+    list: '{% url "inbox_conversations_api" %}',
+    messages: function (id) { return '/api/inbox/' + id + '/messages/'; },
+    chat: function (id) { return '/api/inbox/' + id + '/chat/'; },
+  };
+
+  function getCookie(name) {
+    const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
+    return v ? decodeURIComponent(v[2]) : null;
+  }
+
+  function formatTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function userAvatarLabel() {
+    return selectedChannel === 'messenger' ? 'Cust' : 'You';
+  }
+
+  function renderBubbleMarkdown(bodyEl, text) {
+    bodyEl.textContent = '';
+    if (!text) return;
+
+    function consumeWith(re) {
+      let last = 0;
+      let m;
+      let found = false;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        found = true;
+        if (m.index > last) {
+          bodyEl.appendChild(document.createTextNode(text.slice(last, m.index)));
+        }
+        let src = m[2].replace(/\)+$/g, '').replace(/,+$/g, '');
+        if (src.startsWith('/')) {
+          src = window.location.origin + src;
+        }
+        if (!/^https?:\/\//i.test(src)) {
+          bodyEl.appendChild(document.createTextNode(text.slice(m.index, re.lastIndex)));
+          last = re.lastIndex;
+          continue;
+        }
+        const fig = document.createElement('figure');
+        fig.className = 'msg-figure';
+        const img = document.createElement('img');
+        img.className = 'msg-inline-img';
+        img.src = src;
+        img.alt = m[1] || 'Product';
+        img.loading = 'lazy';
+        img.referrerPolicy = 'no-referrer';
+        fig.appendChild(img);
+        if (m[1]) {
+          const cap = document.createElement('figcaption');
+          cap.className = 'msg-figcaption';
+          cap.textContent = m[1];
+          fig.appendChild(cap);
+        }
+        bodyEl.appendChild(fig);
+        last = re.lastIndex;
+      }
+      return { found: found, last: last };
+    }
+
+    const strict = /!\[([^\]]*)\]\(\s*([^)\s]+)\s*\)/g;
+    let { found, last } = consumeWith(strict);
+    if (!found) {
+      bodyEl.textContent = '';
+      const loose = /!\[([^\]]*)\]\(\s*(https?:\/\/[^ \t\n]+)/gi;
+      ({ found, last } = consumeWith(loose));
+    }
+    if (!found) {
+      bodyEl.textContent = text;
+      return;
+    }
+    if (last < text.length) {
+      bodyEl.appendChild(document.createTextNode(text.slice(last)));
+    }
+  }
+
+  function rowEl(m) {
+    const row = document.createElement('div');
+    row.className = 'msg-row ' + (m.role === 'user' ? 'msg-row-user' : 'msg-row-bot');
+
+    const av = document.createElement('div');
+    av.className = 'msg-avatar ' + (m.role === 'user' ? 'msg-avatar-user' : 'msg-avatar-bot');
+    av.textContent = m.role === 'user' ? userAvatarLabel() : 'AI';
+
+    const col = document.createElement('div');
+    col.className = 'msg-stack';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble ' + (m.role === 'user' ? 'msg-bubble-user' : 'msg-bubble-bot');
+
+    const userImgUrls = (m.user_image_urls && m.user_image_urls.length) ? m.user_image_urls : [];
+    if (m.text) {
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      if (m.role === 'assistant') {
+        renderBubbleMarkdown(body, m.text);
+      } else {
+        body.textContent = m.text;
+      }
+      bubble.appendChild(body);
+    }
+    if (m.role === 'user' && userImgUrls.length) {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg-user-images';
+      for (const srcRaw of userImgUrls) {
+        let src = srcRaw;
+        if (src.startsWith('/')) src = window.location.origin + src;
+        const fig = document.createElement('figure');
+        fig.className = 'msg-figure';
+        const img = document.createElement('img');
+        img.className = 'msg-inline-img';
+        img.src = src;
+        img.alt = 'Your photo';
+        img.loading = 'lazy';
+        fig.appendChild(img);
+        wrap.appendChild(fig);
+      }
+      bubble.appendChild(wrap);
+    } else if (m.had_image && m.role === 'user') {
+      const tag = document.createElement('div');
+      tag.className = 'msg-photo-tag';
+      tag.textContent = m.text ? 'Photo attached' : 'Photo';
+      bubble.appendChild(tag);
+    }
+    if (!m.text && !(m.had_image && m.role === 'user') && !userImgUrls.length) {
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      body.textContent = '…';
+      bubble.appendChild(body);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    meta.textContent = formatTime(m.time);
+
+    col.appendChild(bubble);
+    col.appendChild(meta);
+    row.appendChild(av);
+    row.appendChild(col);
+    return row;
+  }
+
+  function renderMessages(messages) {
+    thread.innerHTML = '';
+    for (const m of messages) {
+      thread.appendChild(rowEl(m));
+    }
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  function appendError(text) {
+    const row = document.createElement('div');
+    row.className = 'msg-row msg-row-bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble msg-bubble-err';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    thread.appendChild(row);
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  function isMobileInbox() {
+    return mqMobile.matches;
+  }
+
+  function setMobileChatOpen(open) {
+    if (!inboxShell) return;
+    if (!isMobileInbox()) {
+      inboxShell.classList.remove('inbox-mobile-show-chat');
+      return;
+    }
+    if (open) {
+      inboxShell.classList.add('inbox-mobile-show-chat');
+    } else {
+      inboxShell.classList.remove('inbox-mobile-show-chat');
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.delete('c');
+        const tail = (u.pathname || '/') + (u.search || '');
+        history.replaceState(null, '', tail);
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  mqMobile.addEventListener('change', function () {
+    if (!isMobileInbox()) inboxShell.classList.remove('inbox-mobile-show-chat');
+    else if (selectedId) setMobileChatOpen(true);
+  });
+
+  if (backBtn) {
+    backBtn.addEventListener('click', function () {
+      setMobileChatOpen(false);
+    });
+  }
+
+  function renderConvList() {
+    listEl.innerHTML = '';
+    for (const c of conversations) {
+      const li = document.createElement('li');
+      li.className = 'conv-item' + (c.id === selectedId ? ' conv-item-active' : '');
+      li.dataset.id = String(c.id);
+      const t = document.createElement('div');
+      t.className = 'conv-item-title';
+      t.textContent = c.title;
+      const ch = document.createElement('span');
+      ch.className = 'conv-item-channel';
+      ch.textContent = c.channel_label;
+      t.appendChild(ch);
+      const p = document.createElement('div');
+      p.className = 'conv-item-preview';
+      p.textContent = c.preview || '—';
+      li.appendChild(t);
+      li.appendChild(p);
+      li.addEventListener('click', function () {
+        selectConversation(Number(li.dataset.id));
+      });
+      listEl.appendChild(li);
+    }
+  }
+
+  async function loadConversations() {
+    try {
+      const r = await fetch(urls.list);
+      const data = await r.json().catch(function () { return {}; });
+      if (!r.ok || !data.ok) {
+        appendError(data.error || ('Could not load conversations (' + r.status + ').'));
+        return;
+      }
+      conversations = (data.conversations && data.conversations.slice()) || [];
+      if (!selectedId) {
+        if (urlConversationId) {
+          selectedId = urlConversationId;
+        } else if (conversations.length) {
+          selectedId = conversations[0].id;
+        }
+      }
+      renderConvList();
+      if (selectedId) {
+        const cidParam = new URLSearchParams(window.location.search).get('c');
+        const cidN = cidParam ? Number(cidParam) : 0;
+        const revealMobile =
+          isMobileInbox() && !isNaN(cidN) && cidN === selectedId;
+        await loadThread(selectedId, { revealMobile: revealMobile });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadThread(id, opts) {
+    opts = opts || {};
+    thread.innerHTML = '';
+    try {
+      const r = await fetch(urls.messages(id));
+      const data = await r.json().catch(function () { return {}; });
+      if (!r.ok || !data.ok) {
+        appendError(data.error || 'Could not load thread.');
+        return;
+      }
+      selectedId = id;
+      if (data.conversation) {
+        const c = data.conversation;
+        const idx = conversations.findIndex(function (x) { return x.id === c.id; });
+        if (idx >= 0) conversations[idx] = c;
+        else conversations.unshift(c);
+      }
+      selectedChannel = data.conversation.channel;
+      canCompose = !!data.conversation.can_compose;
+      titleEl.textContent = data.conversation.title;
+      subEl.textContent = canCompose
+        ? 'Web test — messages go to the AI only (same as Testing / Production for Messenger outbound).'
+        : 'Messenger — read conversation here; customers message your Page.';
+      composerWrap.hidden = !canCompose;
+      renderMessages(data.messages || []);
+      renderConvList();
+      if (opts.revealMobile) setMobileChatOpen(true);
+      history.replaceState(null, '', '?c=' + id);
+    } catch (err) {
+      appendError(String(err));
+    }
+  }
+
+  function selectConversation(id) {
+    if (id === selectedId) {
+      if (isMobileInbox()) setMobileChatOpen(true);
+      return;
+    }
+    pendingSegments = [];
+    clearBatchTimers();
+    updateBatchUi();
+    selectedId = id;
+    loadThread(id, { revealMobile: true });
+  }
+
+  function clearBatchTimers() {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+
+  function updateBatchUi() {
+    if (!canCompose) {
+      batchBar.hidden = true;
+      return;
+    }
+    if (!pendingSegments.length && !debounceTimer) {
+      batchBar.hidden = true;
+      return;
+    }
+    batchBar.hidden = false;
+    const rem = debounceTimer ? Math.max(0, Math.ceil((batchDeadline - Date.now()) / 1000)) : 0;
+    batchStatus.textContent =
+      pendingSegments.length +
+      ' part(s) queued — sending in ' +
+      rem +
+      's (add more to reset timer, or Send now).';
+    flushBatchBtn.disabled = isSending;
+  }
+
+  function scheduleBatch() {
+    clearBatchTimers();
+    batchDeadline = Date.now() + BATCH_MS;
+    tickTimer = setInterval(updateBatchUi, 250);
+    debounceTimer = setTimeout(function () {
+      clearBatchTimers();
+      flushBatch();
+    }, BATCH_MS);
+    updateBatchUi();
+  }
+
+  async function flushBatch() {
+    if (!canCompose || !selectedId) return;
+    if (isSending) return;
+    clearBatchTimers();
+    if (!pendingSegments.length) {
+      updateBatchUi();
+      return;
+    }
+    const segments = pendingSegments.splice(0);
+    updateBatchUi();
+
+    const texts = segments.map(function (s) { return s.text.trim(); }).filter(Boolean);
+    const combinedText = texts.join('\n\n---\n\n');
+    const allFiles = segments.reduce(function (a, s) { return a.concat(s.files); }, []);
+    if (!combinedText && !allFiles.length) return;
+
+    const fd = new FormData();
+    const tok = form.querySelector('[name=csrfmiddlewaretoken]');
+    if (tok) fd.append('csrfmiddlewaretoken', tok.value);
+    if (combinedText) fd.append('message', combinedText);
+    allFiles.forEach(function (f) { fd.append('images', f); });
+
+    isSending = true;
+    btn.disabled = true;
+    flushBatchBtn.disabled = true;
+    statusEl.textContent = 'Sending batched message…';
+    try {
+      const r = await fetch(urls.chat(selectedId), {
+        method: 'POST',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') || '' },
+        body: fd,
+      });
+      const data = await r.json().catch(function () { return {}; });
+      if (!r.ok || !data.ok) {
+        appendError(data.error || 'Something went wrong.');
+      } else if (data.messages) {
+        renderMessages(data.messages);
+      }
+      await loadConversations();
+    } catch (err) {
+      appendError(String(err));
+    } finally {
+      isSending = false;
+      btn.disabled = false;
+      statusEl.textContent = '';
+      if (pendingSegments.length) scheduleBatch();
+      else updateBatchUi();
+    }
+  }
+
+  flushBatchBtn.addEventListener('click', function () {
+    flushBatch();
+  });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!canCompose || !selectedId) return;
+    statusEl.textContent = '';
+    const msg = textarea.value.trim();
+    const files = Array.from(fileInput.files);
+    if (!msg && !files.length) {
+      statusEl.textContent = 'Type a message or attach a photo.';
+      return;
+    }
+    pendingSegments.push({ text: msg, files: files });
+    textarea.value = '';
+    textarea.style.height = 'auto';
+    fileInput.value = '';
+    attachName.textContent = '';
+    scheduleBatch();
+  });
+
+  fileInput.addEventListener('change', function () {
+    const n = fileInput.files.length;
+    attachName.textContent = n ? (n === 1 ? fileInput.files[0].name : n + ' photos') : '';
+  });
+
+  textarea.addEventListener('input', function () {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+  });
+
+  loadConversations();
+})();
+</script>
+{% endblock %}

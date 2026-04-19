@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% block title %}Settings · Shop assistant{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Settings</h1>
+  <p class="muted">
+    Chat uses <strong>round-robin</strong> across every enabled API key, alternating
+    <code>gemma-4-26b-a4b-it</code> and <code>gemma-4-31b-it</code> per key ({{ chat_slots }} chat rotation slots from {{ n_keys }} key{{ n_keys|pluralize }}).
+    Embeddings always use <code>gemini-embedding-2-preview</code> (keys rotate for quota). If no keys are saved here, <code>GEMINI_API_KEY</code> in the environment is used as a single key.
+  </p>
+
+  <form method="post" enctype="multipart/form-data" class="stack">
+    {% csrf_token %}
+    <fieldset class="fieldset">
+      <legend>Assistant &amp; deployment</legend>
+
+      {{ form.non_field_errors }}
+
+      <div class="deploy-block">
+        <h2 class="deploy-title">Testing or Production</h2>
+        <p class="muted deploy-hint">
+          <strong>Testing</strong>: webhook still runs and the AI reply is saved — you see it in the inbox; customers on Messenger get nothing back.
+          <strong>Production</strong>: the same reply is sent to the customer on Messenger.
+        </p>
+        {% if form.deployment_mode.errors %}
+          <div class="err">{{ form.deployment_mode.errors }}</div>
+        {% endif %}
+        <div class="deploy-options" role="radiogroup" aria-label="Messenger deployment mode">
+          {% for choice in form.deployment_mode %}
+            <label class="deploy-card">
+              {{ choice.tag }}
+              <span class="deploy-card-label">{{ choice.choice_label }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        {% if form.deployment_mode.help_text %}
+          <p class="muted deploy-help">{{ form.deployment_mode.help_text }}</p>
+        {% endif %}
+      </div>
+
+      <p class="field-p">
+        <label for="{{ form.messenger_verify_token.id_for_label }}">{{ form.messenger_verify_token.label }}</label>
+        {{ form.messenger_verify_token }}
+        {% if form.messenger_verify_token.help_text %}
+          <span class="muted field-hint">{{ form.messenger_verify_token.help_text }}</span>
+        {% endif %}
+        {{ form.messenger_verify_token.errors }}
+      </p>
+
+      <hr class="fieldset-sep">
+
+      <p class="field-p">
+        <label for="{{ form.system_prompt.id_for_label }}">{{ form.system_prompt.label }}</label>
+        {{ form.system_prompt }}
+        {{ form.system_prompt.errors }}
+      </p>
+      <p class="field-p">
+        <label for="{{ form.embedding_output_dimensionality.id_for_label }}">{{ form.embedding_output_dimensionality.label }}</label>
+        {{ form.embedding_output_dimensionality }}
+        {{ form.embedding_output_dimensionality.errors }}
+      </p>
+      <p class="field-p">
+        <label for="{{ form.similarity_top_k.id_for_label }}">{{ form.similarity_top_k.label }}</label>
+        {{ form.similarity_top_k }}
+        {{ form.similarity_top_k.errors }}
+      </p>
+
+      <button type="submit" name="save_settings" class="btn primary">Save settings</button>
+    </fieldset>
+  </form>
+
+  <h2 class="panel-sub">Messenger webhook URL</h2>
+  <p class="muted">
+    In Meta Developer Console, set the callback URL below and paste the <strong>same verify token</strong> you saved above (or set <code>MESSENGER_VERIFY_TOKEN</code> in the environment if the field is empty).
+  </p>
+  {% if messenger_webhook_url %}
+  <p><strong>Webhook URL:</strong> <code class="webhook-url">{{ messenger_webhook_url }}</code></p>
+  {% else %}
+  <p class="muted">Override with <code>MESSENGER_WEBHOOK_PUBLIC_URL</code> or <code>PUBLIC_WEBHOOK_BASE</code> + <code>MESSENGER_WEBHOOK_PATH</code> (default path <code>/api/webhook/</code>).</p>
+  {% endif %}
+  <p class="muted">Also set <code>MESSENGER_PAGE_ACCESS_TOKEN</code> (and optionally <code>MESSENGER_APP_SECRET</code> for signature verification).</p>
+</section>
+
+<section class="panel">
+  <h2>Gemini API keys</h2>
+  {% if gemini_usage.source == "database" %}
+  <p class="ok">
+    <strong>Now using {{ gemini_usage.count }} key(s) from this app’s database</strong> (round-robin for chat + embed). Your Django process is <strong>not</strong> using <code>GEMINI_API_KEY</code> from <code>.env</code> while these enabled keys exist{% if gemini_usage.env_present_but_ignored %} (you have <code>.env</code> set too — it is ignored){% endif %}.
+  </p>
+  {% elif gemini_usage.source == "environment" %}
+  <p class="muted">
+    <strong>Using only <code>GEMINI_API_KEY</code> from the environment</strong> — no enabled keys in the database. Add keys below to switch to database keys.
+  </p>
+  {% else %}
+  <p class="err">No Gemini keys: add keys below or set <code>GEMINI_API_KEY</code> in the environment.</p>
+  {% endif %}
+  <p class="muted">
+    <strong>Google AI Studio dashboard:</strong> usage from this app is <strong>API traffic</strong> on your key, not the AI Studio web “chat” playground. Charts can lag; check the same Google account that created the key. If you use keys from two accounts, each account’s console only shows its own key’s usage.
+  </p>
+  <p class="muted">Add multiple keys (e.g. different Google accounts) to spread free-tier limits. Each key uses these chat models in rotation: {% for m in gemma_models %}<code>{{ m }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.</p>
+
+  <form method="post" class="stack tight">
+    {% csrf_token %}
+    <fieldset class="fieldset">
+      <legend>Add key</legend>
+      {{ cform.as_p }}
+      <button type="submit" name="add_credential" class="btn primary">Save key</button>
+    </fieldset>
+  </form>
+
+  {% if credentials %}
+  <ul class="cred-list">
+    {% for c in credentials %}
+    <li class="cred-row">
+      <div class="meta">
+        <strong>{{ c.label|default:"(no label)" }}</strong>
+        <span class="muted">order {{ c.sort_order }}</span>
+        {% if c.enabled %}<span class="ok">enabled</span>{% else %}<span class="muted">disabled</span>{% endif %}
+        <form method="post" class="inline">
+          {% csrf_token %}
+          <input type="hidden" name="credential_id" value="{{ c.pk }}">
+          <button type="submit" name="delete_credential" class="btn danger sm">Remove</button>
+        </form>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No keys in the database yet—set <code>GEMINI_API_KEY</code> or add a key above.</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>Product catalog</h2>
+  <p class="muted">Upload product photos. Each image is embedded with the same model as user photos so similarity search is meaningful.</p>
+
+  <form method="post" enctype="multipart/form-data" class="stack tight">
+    {% csrf_token %}
+    <fieldset class="fieldset">
+      <legend>Add product image</legend>
+      {{ pform.as_p }}
+      <button type="submit" name="add_product" class="btn primary">Add product</button>
+    </fieldset>
+  </form>
+
+  {% if products %}
+  <ul class="product-list">
+    {% for p in products %}
+    <li class="product-row">
+      {% if p.image %}
+      <img src="{{ p.image.url }}" alt="" class="thumb">
+      {% endif %}
+      <div class="meta">
+        <strong>{{ p.name|default:p.pk }}</strong>
+        {% if p.notes %}<div class="notes">{{ p.notes }}</div>{% endif %}
+        {% if p.embedding_error %}
+        <div class="err">Embedding: {{ p.embedding_error }}</div>
+        {% elif p.embedding %}
+        <div class="ok">Indexed ({{ p.embedding|length }} dims)</div>
+        {% else %}
+        <div class="muted">Embedding pending…</div>
+        {% endif %}
+        <form method="post" class="inline">
+          {% csrf_token %}
+          <input type="hidden" name="product_id" value="{{ p.pk }}">
+          <button type="submit" name="delete_product" class="btn danger sm">Remove</button>
+        </form>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No products yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

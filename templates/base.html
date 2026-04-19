@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}Shop chat{% endblock %}</title>
+  {% load static %}
+  <link rel="stylesheet" href="{% static 'shopchat/app.css' %}">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <header class="top">
+    <a class="brand" href="{% url 'inbox' %}">Alankar assistant</a>
+    <nav>
+      <a href="{% url 'inbox' %}">Inbox</a>
+      <a href="{% url 'settings' %}">Settings &amp; catalog</a>
+      <a href="/admin/">Admin</a>
+    </nav>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

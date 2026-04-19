@@ -1,0 +1,342 @@
+{% extends "base.html" %}
+{% block title %}Chat · Shop assistant{% endblock %}
+{% block body_class %}page-messenger{% endblock %}
+{% block content %}
+<div class="messenger" id="messenger-root" data-batch-ms="{{ batch_idle_ms|default:20000 }}">
+  <div class="messenger-head">
+    <div>
+      <h1 class="messenger-title">Messages</h1>
+      <p class="messenger-sub">Up to 20 recent messages are kept for context. Each Send queues a part; after <strong>{{ batch_idle_sec|default:20 }}s</strong> idle everything sends in one reply (or tap Send now).</p>
+    </div>
+  </div>
+
+  <div id="thread" class="messenger-thread" aria-live="polite"></div>
+
+  <div id="batch-bar" class="batch-bar" hidden>
+    <span id="batch-status" class="batch-status"></span>
+    <button type="button" class="btn batch-now" id="flush-batch-btn">Send now</button>
+  </div>
+
+  <div class="messenger-composer">
+    <form id="chat-form" class="composer-form" enctype="multipart/form-data">
+      {% csrf_token %}
+      <div class="composer-attach">
+        <label class="attach-btn" title="Add photos (multiple)">
+          <input type="file" name="images" accept="image/*" multiple hidden>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+        </label>
+        <span id="attach-name" class="attach-name"></span>
+      </div>
+      <div class="composer-row">
+        <textarea name="message" rows="1" class="composer-input" placeholder="Message…" autocomplete="off"></textarea>
+        <button type="submit" class="composer-send" id="send-btn" aria-label="Send">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+      </div>
+      <div id="status" class="composer-status" role="status"></div>
+    </form>
+  </div>
+</div>
+
+<script>
+(function () {
+  const root = document.getElementById('messenger-root');
+  const BATCH_MS = Number(root.dataset.batchMs) || 20000;
+  const form = document.getElementById('chat-form');
+  const thread = document.getElementById('thread');
+  const statusEl = document.getElementById('status');
+  const btn = document.getElementById('send-btn');
+  const fileInput = form.querySelector('input[name="images"]');
+  const attachName = document.getElementById('attach-name');
+  const textarea = form.querySelector('textarea');
+  const batchBar = document.getElementById('batch-bar');
+  const batchStatus = document.getElementById('batch-status');
+  const flushBatchBtn = document.getElementById('flush-batch-btn');
+
+  let pendingSegments = [];
+  let debounceTimer = null;
+  let tickTimer = null;
+  let batchDeadline = 0;
+  let isSending = false;
+
+  function getCookie(name) {
+    const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
+    return v ? decodeURIComponent(v[2]) : null;
+  }
+
+  function formatTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function renderMessages(messages) {
+    thread.innerHTML = '';
+    for (const m of messages) {
+      thread.appendChild(rowEl(m));
+    }
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  /** Safe text + Markdown images ![alt](url) for assistant replies */
+  function renderBubbleMarkdown(bodyEl, text) {
+    bodyEl.textContent = '';
+    if (!text) return;
+
+    function consumeWith(re) {
+      let last = 0;
+      let m;
+      let found = false;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        found = true;
+        if (m.index > last) {
+          bodyEl.appendChild(document.createTextNode(text.slice(last, m.index)));
+        }
+        let src = m[2].replace(/\)+$/g, '').replace(/,+$/g, '');
+        if (src.startsWith('/')) {
+          src = window.location.origin + src;
+        }
+        if (!/^https?:\/\//i.test(src)) {
+          bodyEl.appendChild(document.createTextNode(text.slice(m.index, re.lastIndex)));
+          last = re.lastIndex;
+          continue;
+        }
+        const fig = document.createElement('figure');
+        fig.className = 'msg-figure';
+        const img = document.createElement('img');
+        img.className = 'msg-inline-img';
+        img.src = src;
+        img.alt = m[1] || 'Product';
+        img.loading = 'lazy';
+        img.referrerPolicy = 'no-referrer';
+        fig.appendChild(img);
+        if (m[1]) {
+          const cap = document.createElement('figcaption');
+          cap.className = 'msg-figcaption';
+          cap.textContent = m[1];
+          fig.appendChild(cap);
+        }
+        bodyEl.appendChild(fig);
+        last = re.lastIndex;
+      }
+      return { found: found, last: last };
+    }
+
+    const strict = /!\[([^\]]*)\]\(\s*([^)\s]+)\s*\)/g;
+    let { found, last } = consumeWith(strict);
+    if (!found) {
+      bodyEl.textContent = '';
+      const loose = /!\[([^\]]*)\]\(\s*(https?:\/\/[^ \t\n]+)/gi;
+      ({ found, last } = consumeWith(loose));
+    }
+    if (!found) {
+      bodyEl.textContent = text;
+      return;
+    }
+    if (last < text.length) {
+      bodyEl.appendChild(document.createTextNode(text.slice(last)));
+    }
+  }
+
+  function rowEl(m) {
+    const row = document.createElement('div');
+    row.className = 'msg-row ' + (m.role === 'user' ? 'msg-row-user' : 'msg-row-bot');
+
+    const av = document.createElement('div');
+    av.className = 'msg-avatar ' + (m.role === 'user' ? 'msg-avatar-user' : 'msg-avatar-bot');
+    av.textContent = m.role === 'user' ? 'You' : 'AI';
+
+    const col = document.createElement('div');
+    col.className = 'msg-stack';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble ' + (m.role === 'user' ? 'msg-bubble-user' : 'msg-bubble-bot');
+
+    const userImgUrls = (m.user_image_urls && m.user_image_urls.length) ? m.user_image_urls : [];
+    if (m.text) {
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      if (m.role === 'assistant') {
+        renderBubbleMarkdown(body, m.text);
+      } else {
+        body.textContent = m.text;
+      }
+      bubble.appendChild(body);
+    }
+    if (m.role === 'user' && userImgUrls.length) {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg-user-images';
+      for (const srcRaw of userImgUrls) {
+        let src = srcRaw;
+        if (src.startsWith('/')) src = window.location.origin + src;
+        const fig = document.createElement('figure');
+        fig.className = 'msg-figure';
+        const img = document.createElement('img');
+        img.className = 'msg-inline-img';
+        img.src = src;
+        img.alt = 'Your photo';
+        img.loading = 'lazy';
+        fig.appendChild(img);
+        wrap.appendChild(fig);
+      }
+      bubble.appendChild(wrap);
+    } else if (m.had_image && m.role === 'user') {
+      const tag = document.createElement('div');
+      tag.className = 'msg-photo-tag';
+      tag.textContent = m.text ? 'Photo attached' : 'Photo';
+      bubble.appendChild(tag);
+    }
+    if (!m.text && !(m.had_image && m.role === 'user') && !userImgUrls.length) {
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      body.textContent = '…';
+      bubble.appendChild(body);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    meta.textContent = formatTime(m.time);
+
+    col.appendChild(bubble);
+    col.appendChild(meta);
+    row.appendChild(av);
+    row.appendChild(col);
+    return row;
+  }
+
+  function appendError(text) {
+    const row = document.createElement('div');
+    row.className = 'msg-row msg-row-bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble msg-bubble-err';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    thread.appendChild(row);
+    thread.scrollTop = thread.scrollHeight;
+  }
+
+  fileInput.addEventListener('change', function () {
+    const n = fileInput.files.length;
+    attachName.textContent = n ? (n === 1 ? fileInput.files[0].name : n + ' photos') : '';
+  });
+
+  textarea.addEventListener('input', function () {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+  });
+
+  async function loadHistory() {
+    try {
+      const r = await fetch('{% url "chat_history_api" %}');
+      const data = await r.json();
+      if (data.ok && data.messages) renderMessages(data.messages);
+    } catch (e) { /* ignore */ }
+  }
+
+  function clearBatchTimers() {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+
+  function updateBatchUi() {
+    if (!pendingSegments.length && !debounceTimer) {
+      batchBar.hidden = true;
+      return;
+    }
+    batchBar.hidden = false;
+    const rem = debounceTimer ? Math.max(0, Math.ceil((batchDeadline - Date.now()) / 1000)) : 0;
+    batchStatus.textContent =
+      pendingSegments.length +
+      ' part(s) queued — sending in ' +
+      rem +
+      's (add more to reset timer, or Send now).';
+    flushBatchBtn.disabled = isSending;
+  }
+
+  function scheduleBatch() {
+    clearBatchTimers();
+    batchDeadline = Date.now() + BATCH_MS;
+    tickTimer = setInterval(updateBatchUi, 250);
+    debounceTimer = setTimeout(function () {
+      clearBatchTimers();
+      flushBatch();
+    }, BATCH_MS);
+    updateBatchUi();
+  }
+
+  async function flushBatch() {
+    if (isSending) return;
+    clearBatchTimers();
+    if (!pendingSegments.length) {
+      updateBatchUi();
+      return;
+    }
+    const segments = pendingSegments.splice(0);
+    updateBatchUi();
+
+    const texts = segments.map(function (s) { return s.text.trim(); }).filter(Boolean);
+    const combinedText = texts.join('\n\n---\n\n');
+    const allFiles = segments.reduce(function (a, s) { return a.concat(s.files); }, []);
+    if (!combinedText && !allFiles.length) return;
+
+    const fd = new FormData();
+    const tok = form.querySelector('[name=csrfmiddlewaretoken]');
+    if (tok) fd.append('csrfmiddlewaretoken', tok.value);
+    if (combinedText) fd.append('message', combinedText);
+    allFiles.forEach(function (f) { fd.append('images', f); });
+
+    isSending = true;
+    btn.disabled = true;
+    flushBatchBtn.disabled = true;
+    statusEl.textContent = 'Sending batched message…';
+    try {
+      const r = await fetch('{% url "chat_api" %}', {
+        method: 'POST',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') || '' },
+        body: fd,
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        appendError(data.error || 'Something went wrong.');
+      } else if (data.messages) {
+        renderMessages(data.messages);
+      }
+    } catch (err) {
+      appendError(String(err));
+    } finally {
+      isSending = false;
+      btn.disabled = false;
+      statusEl.textContent = '';
+      if (pendingSegments.length) scheduleBatch();
+      else updateBatchUi();
+    }
+  }
+
+  flushBatchBtn.addEventListener('click', function () {
+    flushBatch();
+  });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    statusEl.textContent = '';
+    const msg = textarea.value.trim();
+    const files = Array.from(fileInput.files);
+    if (!msg && !files.length) {
+      statusEl.textContent = 'Type a message or attach a photo.';
+      return;
+    }
+    pendingSegments.push({ text: msg, files: files });
+    textarea.value = '';
+    textarea.style.height = 'auto';
+    fileInput.value = '';
+    attachName.textContent = '';
+    scheduleBatch();
+  });
+
+  loadHistory();
+})();
+</script>
+{% endblock %}
