@@ -45,7 +45,7 @@ MESSENGER_WEBHOOK_PUBLIC_URL = os.environ.get("MESSENGER_WEBHOOK_PUBLIC_URL", ""
 # Option B: or set base only; display URL = PUBLIC_WEBHOOK_BASE + MESSENGER_WEBHOOK_PATH
 PUBLIC_WEBHOOK_BASE = os.environ.get(
     "PUBLIC_WEBHOOK_BASE",
-    "https://bot.sohag.com.bd",
+    "https://ai.sohag.com.bd",
 ).rstrip("/")
 _raw_path = os.environ.get("MESSENGER_WEBHOOK_PATH", "/api/webhook").strip() or "/api/webhook"
 if not _raw_path.startswith("/"):

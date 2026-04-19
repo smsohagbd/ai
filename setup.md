@@ -171,4 +171,5 @@ git push origin main
 
 
 git pull
-python manage.py runserver 0.0.0.0:8000
+sudo systemctl daemon-reload
+sudo systemctl restart ai.service
