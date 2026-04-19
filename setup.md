@@ -168,3 +168,7 @@ git push -u origin main
 git add .
 git commit -m "Initial project files added"
 git push origin main
+
+
+git pull
+python manage.py runserver 0.0.0.0:8000
