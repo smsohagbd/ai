@@ -199,7 +199,6 @@ def inbox_messages_api(request, pk: int):
         {
             "ok": True,
             "conversation": _conversation_row(conv, request),
-            "max_messages": CHAT_HISTORY_MAX_MESSAGES,
             "messenger_manual_send": messenger_manual_send,
             "messages": [_serialize_message(m, request) for m in qs],
         }
