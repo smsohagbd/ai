@@ -710,7 +710,9 @@ def generate_chat_reply(
 
 
 def prune_conversation(conversation_id: int) -> None:
-    limit = int(getattr(django_settings, "CHAT_RETENTION_MAX_MESSAGES", 500))
+    limit = int(getattr(django_settings, "CHAT_RETENTION_MAX_MESSAGES", 0) or 0)
+    if limit <= 0:
+        return
     while (
         ChatMessage.objects.filter(conversation_id=conversation_id).count() > limit
     ):
