@@ -208,6 +208,16 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+# Messenger: wait after the last inbound event before running AI (merge text + images).
+MESSENGER_INGEST_DEBOUNCE_SEC = _env_float("MESSENGER_INGEST_DEBOUNCE_SEC", 1.5)
+MESSENGER_INGEST_DEBOUNCE_SEC = max(0.5, min(float(MESSENGER_INGEST_DEBOUNCE_SEC), 5.0))
+
+try:
+    INBOX_POLL_MS = int(os.environ.get("INBOX_POLL_MS", "2500"))
+except ValueError:
+    INBOX_POLL_MS = 2500
+INBOX_POLL_MS = max(1000, min(INBOX_POLL_MS, 60000))
+
 # Hard caps on outbound Gemini calls per UTC minute (free-tier margin). When full, the app waits
 # until the next minute (up to GEMINI_RL_MAX_WAIT_SEC). Process-wide: all keys share counters
 # (correct when keys are the same Google project). Separate counter per chat model id.

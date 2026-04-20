@@ -3,7 +3,8 @@
 {% block body_class %}page-inbox{% endblock %}
 {% block content %}
 <div class="inbox-shell" id="inbox-root"
-     data-batch-ms="{{ batch_idle_ms|default:5000 }}">
+     data-batch-ms="{{ batch_idle_ms|default:5000 }}"
+     data-poll-ms="{{ inbox_poll_ms|default:2500 }}">
   <aside class="inbox-sidebar" aria-label="Conversations">
     <div class="inbox-sidebar-head">
       <h1 class="inbox-sidebar-title">Messages</h1>
@@ -30,6 +31,7 @@
           <h2 class="messenger-title" id="thread-title">…</h2>
           <p class="messenger-sub" id="thread-sub"></p>
         </div>
+        <button type="button" class="inbox-sync-btn" id="thread-sync-btn" title="Reload all messages from server">⟳ Sync</button>
       </div>
 
       <div id="thread" class="messenger-thread" aria-live="polite"></div>
@@ -66,6 +68,7 @@
 (function () {
   const root = document.getElementById('inbox-root');
   const BATCH_MS = Number(root.dataset.batchMs) || 5000;
+  const POLL_MS = Math.max(1000, Number(root.dataset.pollMs) || 2500);
   /** Deep-link only (?c=). Otherwise we open the first row = most recent activity. */
   let urlConversationId = 0;
   const _qp = new URLSearchParams(window.location.search).get('c');
@@ -100,7 +103,7 @@
   let tickTimer = null;
   let batchDeadline = 0;
   let isSending = false;
-  let messengerPollTimer = null;
+  let threadPollTimer = null;
   let messengerPollSig = '';
   let messengerManualSend = false;
 
@@ -337,20 +340,20 @@
     return messages.length + '|' + (last.time || '');
   }
 
-  function clearMessengerPoll() {
-    if (messengerPollTimer) {
-      clearInterval(messengerPollTimer);
-      messengerPollTimer = null;
+  function clearThreadPoll() {
+    if (threadPollTimer) {
+      clearInterval(threadPollTimer);
+      threadPollTimer = null;
     }
   }
 
-  function startMessengerPoll() {
-    clearMessengerPoll();
-    messengerPollTimer = setInterval(pollOpenMessengerThread, 4000);
+  function startThreadPoll() {
+    clearThreadPoll();
+    threadPollTimer = setInterval(pollOpenThread, POLL_MS);
   }
 
-  async function pollOpenMessengerThread() {
-    if (!selectedId || selectedChannel !== 'messenger' || document.visibilityState === 'hidden') {
+  async function pollOpenThread() {
+    if (!selectedId || document.visibilityState === 'hidden') {
       return;
     }
     try {
@@ -389,7 +392,7 @@
     composerWrap.hidden = true;
     canCompose = false;
     messengerManualSend = false;
-    clearMessengerPoll();
+    clearThreadPoll();
   }
 
   function appendError(text) {
@@ -507,7 +510,7 @@
 
   async function loadThread(id, opts) {
     opts = opts || {};
-    clearMessengerPoll();
+    clearThreadPoll();
     messengerPollSig = '';
     thread.innerHTML = '';
     try {
@@ -533,17 +536,17 @@
       titleEl.textContent = data.conversation.title;
       subEl.textContent = canCompose
         ? 'Web test — messages go to the AI only (same as Testing / Production for Messenger outbound).'
-        : 'Messenger — read conversation here; customers message your Page.';
+        : 'Messenger — thread auto-refreshes; Sync reloads from server. Customers message your Page.';
       composerWrap.hidden = !canCompose;
       const msgs = data.messages || [];
       messengerPollSig = messagesPollSignature(msgs);
       renderMessages(msgs);
-      if (selectedChannel === 'messenger') {
-        startMessengerPoll();
-      }
+      startThreadPoll();
       renderConvList();
       if (opts.revealMobile) setMobileChatOpen(true);
-      history.replaceState(null, '', '?c=' + id);
+      if (!opts.skipHistory) {
+        history.replaceState(null, '', '?c=' + id);
+      }
     } catch (err) {
       appendError(String(err));
     }
@@ -682,8 +685,8 @@
   });
 
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && selectedChannel === 'messenger' && selectedId) {
-      pollOpenMessengerThread();
+    if (document.visibilityState === 'visible' && selectedId) {
+      pollOpenThread();
     }
   });
 
@@ -699,6 +702,21 @@
   async function initInbox() {
     await bootstrapWebKeys();
     await loadConversations();
+  }
+
+  const syncBtn = document.getElementById('thread-sync-btn');
+  if (syncBtn) {
+    syncBtn.addEventListener('click', async function () {
+      if (!selectedId) return;
+      syncBtn.disabled = true;
+      try {
+        await loadThread(selectedId, { revealMobile: false, skipHistory: true });
+      } catch (e) {
+        appendError(String(e));
+      } finally {
+        syncBtn.disabled = false;
+      }
+    });
   }
 
   const newWebBtn = document.getElementById('new-web-conv-btn');

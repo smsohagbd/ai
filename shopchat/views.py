@@ -491,6 +491,7 @@ def inbox_page(request):
                 "INBOX_RECENT_CONVERSATIONS_LIMIT",
                 80,
             ),
+            "inbox_poll_ms": getattr(django_settings, "INBOX_POLL_MS", 2500),
         },
     )
 

@@ -353,6 +353,28 @@ body.page-inbox .wrap {
   background: rgba(91, 159, 212, 0.22);
 }
 
+.inbox-sync-btn {
+  flex-shrink: 0;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.88rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1.2;
+  align-self: flex-start;
+}
+
+.inbox-sync-btn:hover:not(:disabled) {
+  background: rgba(91, 159, 212, 0.12);
+}
+
+.inbox-sync-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .inbox-back-icon {
   font-size: 1.05rem;
   line-height: 1;
