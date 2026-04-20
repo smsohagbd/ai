@@ -19,6 +19,16 @@ urlpatterns = [
         views.inbox_chat_api,
         name="inbox_chat_api",
     ),
+    path(
+        "api/inbox/web/bootstrap/",
+        views.inbox_web_bootstrap,
+        name="inbox_web_bootstrap",
+    ),
+    path(
+        "api/inbox/web/new/",
+        views.inbox_new_web_conversation,
+        name="inbox_new_web_conversation",
+    ),
     path("api/chat/history/", views.chat_history_api, name="chat_history_api"),
     path("api/chat/", views.chat_api, name="chat_api"),
     path("api/webhook/", views.messenger_webhook, name="messenger_webhook"),

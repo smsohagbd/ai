@@ -11,7 +11,10 @@
         <a href="{% url 'settings' %}">Settings</a>
         <a href="/admin/">Admin</a>
       </nav>
-      <p class="inbox-sidebar-sub">Showing the <strong>{{ inbox_recent_limit|default:80 }} most recent</strong> chats (by last activity). Open a thread below or use a direct link — older threads stay in the database but are not listed here.</p>
+      <div class="inbox-sidebar-toolbar">
+        <button type="button" class="btn inbox-new-web-btn" id="new-web-conv-btn">+ New web test chat</button>
+      </div>
+      <p class="inbox-sidebar-sub">Showing the <strong>{{ inbox_recent_limit|default:80 }} most recent</strong> chats (by last activity). Web test threads you create are tied to this browser. Messenger shows all Page conversations.</p>
     </div>
     <ul id="conv-list" class="conv-list"></ul>
   </aside>
@@ -104,7 +107,40 @@
     list: '{% url "inbox_conversations_api" %}',
     messages: function (id) { return '/api/inbox/' + id + '/messages/'; },
     chat: function (id) { return '/api/inbox/' + id + '/chat/'; },
+    bootstrap: '{% url "inbox_web_bootstrap" %}',
+    newWeb: '{% url "inbox_new_web_conversation" %}',
   };
+
+  var LS_WEB_KEYS = 'shopchat_web_keys';
+
+  function getWebKeys() {
+    try {
+      var raw = localStorage.getItem(LS_WEB_KEYS);
+      var a = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(a)) return [];
+      return a.filter(function (k) { return typeof k === 'string' && k.length >= 8 && k.length <= 64; });
+    } catch (e) { return []; }
+  }
+
+  function setWebKeys(arr) {
+    localStorage.setItem(LS_WEB_KEYS, JSON.stringify(arr));
+  }
+
+  function addWebKey(k) {
+    var keys = getWebKeys();
+    if (keys.indexOf(k) === -1) keys.push(k);
+    setWebKeys(keys);
+  }
+
+  function webKeysHeader() {
+    return getWebKeys().join(',');
+  }
+
+  function inboxFetchHeaders(extra) {
+    var h = Object.assign({}, extra || {});
+    h['X-Web-Client-Keys'] = webKeysHeader();
+    return h;
+  }
 
   function getCookie(name) {
     const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
@@ -270,7 +306,10 @@
       return;
     }
     try {
-      const r = await fetch(urls.messages(selectedId));
+      const r = await fetch(urls.messages(selectedId), {
+        credentials: 'same-origin',
+        headers: inboxFetchHeaders(),
+      });
       const data = await r.json().catch(function () { return {}; });
       if (!r.ok || !data.ok || !data.messages) return;
       const sig = messagesPollSignature(data.messages);
@@ -286,6 +325,19 @@
       thread.appendChild(rowEl(m));
     }
     thread.scrollTop = thread.scrollHeight;
+  }
+
+  function showThreadPlaceholder() {
+    thread.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'thread-placeholder';
+    p.textContent = 'No conversation selected. Open a Messenger thread from the list, or tap “New web test chat” to talk to the AI.';
+    thread.appendChild(p);
+    titleEl.textContent = 'Inbox';
+    subEl.textContent = '';
+    composerWrap.hidden = true;
+    canCompose = false;
+    clearMessengerPoll();
   }
 
   function appendError(text) {
@@ -335,7 +387,7 @@
 
   async function refreshConversationListOnly() {
     try {
-      const r = await fetch(urls.list);
+      const r = await fetch(urls.list, { credentials: 'same-origin', headers: inboxFetchHeaders() });
       const data = await r.json().catch(function () { return {}; });
       if (!r.ok || !data.ok) return;
       conversations = (data.conversations && data.conversations.slice()) || [];
@@ -370,15 +422,19 @@
 
   async function loadConversations() {
     try {
-      const r = await fetch(urls.list);
+      const r = await fetch(urls.list, { credentials: 'same-origin', headers: inboxFetchHeaders() });
       const data = await r.json().catch(function () { return {}; });
       if (!r.ok || !data.ok) {
         appendError(data.error || ('Could not load conversations (' + r.status + ').'));
         return;
       }
       conversations = (data.conversations && data.conversations.slice()) || [];
+      const ids = conversations.map(function (c) { return c.id; });
+      if (selectedId && ids.indexOf(selectedId) === -1) {
+        selectedId = null;
+      }
       if (!selectedId) {
-        if (urlConversationId) {
+        if (urlConversationId && ids.indexOf(urlConversationId) !== -1) {
           selectedId = urlConversationId;
         } else if (conversations.length) {
           selectedId = conversations[0].id;
@@ -391,6 +447,8 @@
         const revealMobile =
           isMobileInbox() && !isNaN(cidN) && cidN === selectedId;
         await loadThread(selectedId, { revealMobile: revealMobile });
+      } else {
+        showThreadPlaceholder();
       }
     } catch (e) { /* ignore */ }
   }
@@ -401,7 +459,10 @@
     messengerPollSig = '';
     thread.innerHTML = '';
     try {
-      const r = await fetch(urls.messages(id));
+      const r = await fetch(urls.messages(id), {
+        credentials: 'same-origin',
+        headers: inboxFetchHeaders(),
+      });
       const data = await r.json().catch(function () { return {}; });
       if (!r.ok || !data.ok) {
         appendError(data.error || 'Could not load thread.');
@@ -513,7 +574,8 @@
     try {
       const r = await fetch(urls.chat(selectedId), {
         method: 'POST',
-        headers: { 'X-CSRFToken': getCookie('csrftoken') || '' },
+        credentials: 'same-origin',
+        headers: inboxFetchHeaders({ 'X-CSRFToken': getCookie('csrftoken') || '' }),
         body: fd,
       });
       const data = await r.json().catch(function () { return {}; });
@@ -572,7 +634,45 @@
     }
   });
 
-  loadConversations();
+  async function bootstrapWebKeys() {
+    try {
+      const r = await fetch(urls.bootstrap, { credentials: 'same-origin' });
+      const data = await r.json().catch(function () { return {}; });
+      if (!data.ok || !data.migrated || !data.web_key) return;
+      addWebKey(data.web_key);
+    } catch (e) { /* ignore */ }
+  }
+
+  async function initInbox() {
+    await bootstrapWebKeys();
+    await loadConversations();
+  }
+
+  const newWebBtn = document.getElementById('new-web-conv-btn');
+  if (newWebBtn) {
+    newWebBtn.addEventListener('click', async function () {
+      try {
+        const r = await fetch(urls.newWeb, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: inboxFetchHeaders({ 'X-CSRFToken': getCookie('csrftoken') || '' }),
+          body: '{}',
+        });
+        const data = await r.json().catch(function () { return {}; });
+        if (!r.ok || !data.ok) {
+          appendError(data.error || 'Could not start a new web test chat.');
+          return;
+        }
+        addWebKey(data.web_key);
+        await loadConversations();
+        await loadThread(data.id, { revealMobile: isMobileInbox() });
+      } catch (e) {
+        appendError(String(e));
+      }
+    });
+  }
+
+  initInbox();
 })();
 </script>
 {% endblock %}

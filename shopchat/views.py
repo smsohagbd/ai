@@ -1,8 +1,9 @@
 import json
 import logging
+import uuid
 
 from django.conf import settings as django_settings
-from django.db.models import OuterRef, Subquery
+from django.db.models import OuterRef, Q, Subquery
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.csrf import csrf_exempt
@@ -66,14 +67,23 @@ def _ensure_chat_session(request) -> str:
     return request.session.session_key
 
 
-def _web_conversation(request) -> Conversation:
-    sk = _ensure_chat_session(request)
-    conv, _ = Conversation.objects.get_or_create(
-        channel=Conversation.Channel.WEB_TEST,
-        web_session_key=sk,
-        defaults={"title": "Web test (this browser)"},
-    )
-    return conv
+def _web_client_keys(request) -> list[str]:
+    """UUID / opaque keys from the browser (localStorage), comma-separated in X-Web-Client-Keys."""
+    raw = (request.headers.get("X-Web-Client-Keys") or "").strip()
+    if not raw:
+        return []
+    keys: list[str] = []
+    for part in raw.split(","):
+        k = part.strip()
+        if 8 <= len(k) <= 64:
+            keys.append(k)
+    return keys[:20]
+
+
+def _owns_web_conversation(request, conv: Conversation) -> bool:
+    if conv.channel != Conversation.Channel.WEB_TEST:
+        return True
+    return conv.web_session_key in _web_client_keys(request)
 
 
 def _serialize_message(m: ChatMessage, request=None) -> dict:
@@ -117,7 +127,7 @@ def _conversation_row(c: Conversation, request) -> dict:
     preview = _preview_for_conversation_row(c)
     can_compose = (
         c.channel == Conversation.Channel.WEB_TEST
-        and c.web_session_key == _ensure_chat_session(request)
+        and c.web_session_key in _web_client_keys(request)
     )
     return {
         "id": c.pk,
@@ -133,17 +143,25 @@ def _conversation_row(c: Conversation, request) -> dict:
 @require_GET
 def inbox_conversations_api(request):
     """Return only the most recently updated threads (see INBOX_RECENT_CONVERSATIONS_LIMIT)."""
-    _web_conversation(request)
     limit = getattr(
         django_settings,
         "INBOX_RECENT_CONVERSATIONS_LIMIT",
         80,
     )
+    keys = _web_client_keys(request)
+    if keys:
+        conv_filter = Q(channel=Conversation.Channel.MESSENGER) | Q(
+            channel=Conversation.Channel.WEB_TEST,
+            web_session_key__in=keys,
+        )
+    else:
+        conv_filter = Q(channel=Conversation.Channel.MESSENGER)
     last_msg = ChatMessage.objects.filter(conversation_id=OuterRef("pk")).order_by(
         "-created_at"
     )
     qs = (
-        Conversation.objects.annotate(
+        Conversation.objects.filter(conv_filter)
+        .annotate(
             _last_preview_text=Subquery(last_msg.values("text")[:1]),
             _last_had_image=Subquery(last_msg.values("had_image")[:1]),
         )
@@ -163,7 +181,7 @@ def inbox_conversations_api(request):
 def inbox_messages_api(request, pk: int):
     conv = get_object_or_404(Conversation, pk=pk)
     if conv.channel == Conversation.Channel.WEB_TEST:
-        if conv.web_session_key != _ensure_chat_session(request):
+        if not _owns_web_conversation(request, conv):
             return JsonResponse({"ok": False, "error": "Not your thread."}, status=403)
     if conv.channel == Conversation.Channel.MESSENGER:
         if ensure_messenger_title_for_conversation(conv):
@@ -187,7 +205,7 @@ def inbox_chat_api(request, pk: int):
             {"ok": False, "error": "Only web test threads can be sent from here."},
             status=400,
         )
-    if conv.web_session_key != _ensure_chat_session(request):
+    if not _owns_web_conversation(request, conv):
         return JsonResponse({"ok": False, "error": "Not your thread."}, status=403)
     try:
         text = (request.POST.get("message") or "").strip()
@@ -242,8 +260,60 @@ def inbox_chat_api(request, pk: int):
 
 
 @require_GET
+def inbox_web_bootstrap(request):
+    """Expose legacy session-keyed web conversation so localStorage can adopt the same key."""
+    sk = _ensure_chat_session(request)
+    conv = Conversation.objects.filter(
+        channel=Conversation.Channel.WEB_TEST,
+        web_session_key=sk,
+    ).first()
+    if not conv:
+        return JsonResponse({"ok": True, "migrated": False})
+    return JsonResponse(
+        {
+            "ok": True,
+            "migrated": True,
+            "id": conv.pk,
+            "web_key": conv.web_session_key,
+        }
+    )
+
+
+@require_http_methods(["POST"])
+def inbox_new_web_conversation(request):
+    """Create a new web test thread; browser must store web_key and send it in X-Web-Client-Keys."""
+    key = str(uuid.uuid4())
+    conv = Conversation.objects.create(
+        channel=Conversation.Channel.WEB_TEST,
+        web_session_key=key,
+        title="Web test",
+    )
+    return JsonResponse({"ok": True, "id": conv.pk, "web_key": key})
+
+
+@require_GET
 def chat_history_api(request):
-    conv = _web_conversation(request)
+    keys = _web_client_keys(request)
+    if not keys:
+        return JsonResponse(
+            {
+                "ok": True,
+                "max_messages": CHAT_HISTORY_MAX_MESSAGES,
+                "messages": [],
+            }
+        )
+    conv = Conversation.objects.filter(
+        channel=Conversation.Channel.WEB_TEST,
+        web_session_key=keys[0],
+    ).first()
+    if not conv:
+        return JsonResponse(
+            {
+                "ok": True,
+                "max_messages": CHAT_HISTORY_MAX_MESSAGES,
+                "messages": [],
+            }
+        )
     qs = conv.messages.order_by("created_at").prefetch_related("user_attachments")
     return JsonResponse(
         {
@@ -256,7 +326,21 @@ def chat_history_api(request):
 
 @require_http_methods(["POST"])
 def chat_api(request):
-    conv = _web_conversation(request)
+    keys = _web_client_keys(request)
+    if not keys:
+        return JsonResponse(
+            {"ok": False, "error": "Send X-Web-Client-Keys (see inbox web test flow)."},
+            status=400,
+        )
+    conv = Conversation.objects.filter(
+        channel=Conversation.Channel.WEB_TEST,
+        web_session_key=keys[0],
+    ).first()
+    if not conv:
+        return JsonResponse(
+            {"ok": False, "error": "No web test conversation for this key."},
+            status=400,
+        )
     try:
         text = (request.POST.get("message") or "").strip()
         user_images: list[tuple[bytes, str]] = []
@@ -340,7 +424,6 @@ def messenger_webhook(request):
 @require_GET
 def inbox_page(request):
     get_app_settings()
-    _web_conversation(request)
     return render(
         request,
         "shopchat/inbox.html",
