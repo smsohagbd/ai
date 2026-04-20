@@ -218,6 +218,11 @@ except ValueError:
     INBOX_POLL_MS = 2500
 INBOX_POLL_MS = max(1000, min(INBOX_POLL_MS, 60000))
 
+# Per-conversation message rows kept in the DB (inbox, sync). Older rows are deleted when over
+# this limit. Model context for Gemini still uses CHAT_HISTORY_MAX_MESSAGES in shopchat.models.
+CHAT_RETENTION_MAX_MESSAGES = _env_int("CHAT_RETENTION_MAX_MESSAGES", 500)
+CHAT_RETENTION_MAX_MESSAGES = max(50, min(CHAT_RETENTION_MAX_MESSAGES, 10000))
+
 # Hard caps on outbound Gemini calls per UTC minute (free-tier margin). When full, the app waits
 # until the next minute (up to GEMINI_RL_MAX_WAIT_SEC). Process-wide: all keys share counters
 # (correct when keys are the same Google project). Separate counter per chat model id.

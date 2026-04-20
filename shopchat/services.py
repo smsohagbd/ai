@@ -7,6 +7,7 @@ import os
 from typing import TYPE_CHECKING
 
 import numpy as np
+from django.conf import settings as django_settings
 from django.db import transaction
 from django.http import HttpRequest
 from google import genai
@@ -709,9 +710,9 @@ def generate_chat_reply(
 
 
 def prune_conversation(conversation_id: int) -> None:
+    limit = int(getattr(django_settings, "CHAT_RETENTION_MAX_MESSAGES", 500))
     while (
-        ChatMessage.objects.filter(conversation_id=conversation_id).count()
-        > CHAT_HISTORY_MAX_MESSAGES
+        ChatMessage.objects.filter(conversation_id=conversation_id).count() > limit
     ):
         oldest = (
             ChatMessage.objects.filter(conversation_id=conversation_id)
