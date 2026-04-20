@@ -20,6 +20,11 @@ urlpatterns = [
         name="inbox_chat_api",
     ),
     path(
+        "api/inbox/<int:pk>/messenger/send/",
+        views.inbox_messenger_send_reply,
+        name="inbox_messenger_send_reply",
+    ),
+    path(
         "api/inbox/web/bootstrap/",
         views.inbox_web_bootstrap,
         name="inbox_web_bootstrap",

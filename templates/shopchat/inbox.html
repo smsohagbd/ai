@@ -102,11 +102,13 @@
   let isSending = false;
   let messengerPollTimer = null;
   let messengerPollSig = '';
+  let messengerManualSend = false;
 
   const urls = {
     list: '{% url "inbox_conversations_api" %}',
     messages: function (id) { return '/api/inbox/' + id + '/messages/'; },
     chat: function (id) { return '/api/inbox/' + id + '/chat/'; },
+    messengerSend: function (convId) { return '/api/inbox/' + convId + '/messenger/send/'; },
     bootstrap: '{% url "inbox_web_bootstrap" %}',
     newWeb: '{% url "inbox_new_web_conversation" %}',
   };
@@ -276,6 +278,52 @@
     meta.className = 'msg-meta';
     meta.textContent = formatTime(m.time);
 
+    if (
+      m.role === 'assistant' &&
+      messengerManualSend &&
+      selectedChannel === 'messenger' &&
+      m.id &&
+      m.text &&
+      m.text.trim()
+    ) {
+      const sendBtn = document.createElement('button');
+      sendBtn.type = 'button';
+      sendBtn.className = 'msg-send-messenger';
+      sendBtn.textContent = 'Send';
+      sendBtn.title = 'Send this reply to the customer on Messenger';
+      sendBtn.addEventListener('click', async function () {
+        if (sendBtn.disabled) return;
+        sendBtn.disabled = true;
+        sendBtn.textContent = '…';
+        try {
+          const r = await fetch(urls.messengerSend(selectedId), {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: inboxFetchHeaders({
+              'Content-Type': 'application/json',
+              'X-CSRFToken': getCookie('csrftoken') || '',
+            }),
+            body: JSON.stringify({ message_id: m.id }),
+          });
+          const data = await r.json().catch(function () { return {}; });
+          if (!r.ok || !data.ok) {
+            appendError(data.error || 'Could not send to Messenger.');
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send';
+            return;
+          }
+          sendBtn.textContent = 'Sent';
+          sendBtn.classList.add('msg-send-messenger-done');
+        } catch (e) {
+          appendError(String(e));
+          sendBtn.disabled = false;
+          sendBtn.textContent = 'Send';
+        }
+      });
+      meta.appendChild(document.createTextNode(' '));
+      meta.appendChild(sendBtn);
+    }
+
     col.appendChild(bubble);
     col.appendChild(meta);
     row.appendChild(av);
@@ -315,6 +363,9 @@
       const sig = messagesPollSignature(data.messages);
       if (sig === messengerPollSig) return;
       messengerPollSig = sig;
+      if (typeof data.messenger_manual_send !== 'undefined') {
+        messengerManualSend = !!data.messenger_manual_send;
+      }
       renderMessages(data.messages);
     } catch (e) { /* ignore */ }
   }
@@ -337,6 +388,7 @@
     subEl.textContent = '';
     composerWrap.hidden = true;
     canCompose = false;
+    messengerManualSend = false;
     clearMessengerPoll();
   }
 
@@ -477,6 +529,7 @@
       }
       selectedChannel = data.conversation.channel;
       canCompose = !!data.conversation.can_compose;
+      messengerManualSend = !!data.messenger_manual_send;
       titleEl.textContent = data.conversation.title;
       subEl.textContent = canCompose
         ? 'Web test — messages go to the AI only (same as Testing / Production for Messenger outbound).'

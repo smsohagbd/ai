@@ -18,11 +18,13 @@ from shopchat.forms import (
 from shopchat.models import (
     CHAT_HISTORY_MAX_MESSAGES,
     GEMINI_GEMMA_CHAT_MODELS,
+    AppSettings,
     ChatMessage,
     Conversation,
     GeminiApiCredential,
     ProductImage,
 )
+from shopchat import messenger_client
 from shopchat.messenger_client import (
     ensure_messenger_title_for_conversation,
     verify_signature,
@@ -95,6 +97,7 @@ def _serialize_message(m: ChatMessage, request=None) -> dict:
                 url = request.build_absolute_uri(url)
             user_image_urls.append(url)
     return {
+        "id": m.pk,
         "role": m.role,
         "text": m.text,
         "had_image": m.had_image,
@@ -187,14 +190,66 @@ def inbox_messages_api(request, pk: int):
         if ensure_messenger_title_for_conversation(conv):
             conv.refresh_from_db()
     qs = conv.messages.order_by("created_at").prefetch_related("user_attachments")
+    app = get_app_settings()
+    messenger_manual_send = (
+        conv.channel == Conversation.Channel.MESSENGER
+        and app.deployment_mode == AppSettings.DeploymentMode.TESTING
+    )
     return JsonResponse(
         {
             "ok": True,
             "conversation": _conversation_row(conv, request),
             "max_messages": CHAT_HISTORY_MAX_MESSAGES,
+            "messenger_manual_send": messenger_manual_send,
             "messages": [_serialize_message(m, request) for m in qs],
         }
     )
+
+
+@require_http_methods(["POST"])
+def inbox_messenger_send_reply(request, pk: int):
+    """Testing mode: send one stored assistant reply to the customer on Messenger."""
+    conv = get_object_or_404(Conversation, pk=pk)
+    if conv.channel != Conversation.Channel.MESSENGER:
+        return JsonResponse(
+            {"ok": False, "error": "Not a Messenger thread."},
+            status=400,
+        )
+    if not (conv.psid or "").strip():
+        return JsonResponse({"ok": False, "error": "Missing PSID."}, status=400)
+    app_settings = get_app_settings()
+    if app_settings.deployment_mode != AppSettings.DeploymentMode.TESTING:
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Manual send is only for Testing mode (Production sends automatically).",
+            },
+            status=400,
+        )
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JsonResponse({"ok": False, "error": "Invalid JSON."}, status=400)
+    raw_mid = body.get("message_id")
+    try:
+        mid = int(raw_mid)
+    except (TypeError, ValueError):
+        return JsonResponse({"ok": False, "error": "message_id required."}, status=400)
+    msg = get_object_or_404(ChatMessage, pk=mid, conversation=conv)
+    if msg.role != ChatMessage.Role.ASSISTANT:
+        return JsonResponse(
+            {"ok": False, "error": "Only assistant messages can be sent."},
+            status=400,
+        )
+    text = (msg.text or "").strip()
+    if not text:
+        return JsonResponse({"ok": False, "error": "Empty message."}, status=400)
+    try:
+        messenger_client.send_messenger_text(conv.psid, text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Messenger manual send failed")
+        return JsonResponse({"ok": False, "error": str(exc)}, status=500)
+    return JsonResponse({"ok": True})
 
 
 @require_http_methods(["POST"])
